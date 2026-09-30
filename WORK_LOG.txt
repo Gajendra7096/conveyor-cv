@@ -1,0 +1,951 @@
+
+================================================================================
+ CONVEYOR CV  -  COMPLETE WORK LOG / TESTING RECORD
+================================================================================
+ Project      : Camera-Based Conveyor Inspection & Tracking System
+ Location     : D:\CV\conveyor_cv
+ Date         : 2026-09-29
+ Python       : 3.14.7
+ Environment  : Windows / PowerShell 5.1
+
+ NOTE ON THIS FILE
+   Sections 0-8 are the original audit pass, written before any source file was
+   changed. They are preserved verbatim in substance but were re-typeset on
+   2026-09-29 after a text-handling mistake truncated them; the original file was
+   not backed up. No measurement, command or finding from that pass was changed
+   or dropped. Section 9 records the fix pass that followed.
+================================================================================
+
+
+--------------------------------------------------------------------------------
+ SECTION 0 : OBJECTIVE
+--------------------------------------------------------------------------------
+ The project implements a 5-module computer-vision brief:
+
+   A  Segmentation  - compare split-and-merge, watershed, Felzenszwalb, mean shift
+   B  Calibration   - checkerboard intrinsics + 4 camera models for box size
+   C  Motion        - hand-built dense Lucas-Kanade optical flow + speed
+   D  Tracking      - constant-velocity Kalman filter, multi-object
+   E  Recognition   - alignment / PCA-eigenbox / Hu-moment box classifiers
+   +  pipeline.py   - integrates A -> B -> C -> D -> E
+
+ Goal of the first work session:
+   1. Run every module end to end and confirm it executes.
+   2. Measure ACCURACY numerically, not just "it ran without crashing".
+   3. Find and document bugs and weak spots.
+   4. Produce a prioritised fix list.
+
+ Key principle followed throughout:
+   "It runs" is NOT the same as "it is correct".
+   Every accuracy claim below is backed by a synthetic fixture with
+   known ground truth, so there is a real number to compare against.
+
+
+--------------------------------------------------------------------------------
+ SECTION 1 : ENVIRONMENT VERIFICATION
+--------------------------------------------------------------------------------
+ Interpreter and libraries actually present on this machine:
+
+   Python     3.14.7
+   numpy      2.5.3
+   opencv     5.0.0
+   scipy      present (rq decomposition used by calibrate.py)
+   skimage    present (felzenszwalb)
+   sklearn    present (MeanShift)
+   pytest     present
+   ruff       present
+
+   All of these are far newer than requirements.txt originally pinned, which
+   specified only lower bounds. This became finding P7: `findChessboardCornersSB`
+   flag names were renamed in OpenCV 5 (CALIB_CB_EXHAUSTIVE is correct here), so
+   an unbounded install on a lab machine would have failed.
+
+
+--------------------------------------------------------------------------------
+ SECTION 2 : STATIC VERIFICATION
+--------------------------------------------------------------------------------
+   python -m pytest        5 passed
+   python -m compileall    clean across all six packages
+   ruff check .            clean
+
+ All three passed before any change, which is the point: the suite was green
+ while the code was demonstrably wrong in five places. That became finding P8.
+
+
+--------------------------------------------------------------------------------
+ SECTION 3 : MODULE EXECUTION AND ACCURACY
+--------------------------------------------------------------------------------
+
+ 3.1  MODULE A - SEGMENTATION
+      CMD  python module_a_segmentation/run_segmentation.py \
+                 --video data/smoke.mp4 --output outputs/segmentation
+      -> all four methods ran on the same five frames; comparison grid,
+         per-method timings and box counts written.
+      Measured s/frame and mean boxes:
+         split_merge       0.004 s   10.2 boxes
+         watershed         0.007 s    2.8 boxes
+         felzenszwalb      0.246 s    9.2 boxes
+         mean_shift        1.661 s   30.0 boxes
+      Watershed is the only method that both finds the few real boxes and stays
+      fast. Mean shift hit the 30-box cap on every frame and produced no
+      coherent box.
+
+ 3.2  MODULE B - CALIBRATION
+      CMD  python module_b_calibration/calibrate.py \
+                 --images data/calib_fixture --cols 9 --rows 6 \
+                 --square-size 2.5 --output outputs/calib_fixture.npz
+      -> 14 synthetic checkerboards, RMS reprojection error 0.0715 px,
+         fx 897.2 against a true 900 (0.31% error).
+      CMD  python module_b_calibration/measure_box.py ...
+      -> all four camera models reported.
+
+      FRONT-PARALLEL CONTROL, run to test identifiability:
+      CMD  ... --images data/calib_frontoparallel
+      -> reprojection error 0.0328 px, i.e. excellent, AND fx = 743562 against
+         a true 900. A near-perfect reprojection fit with a meaningless focal
+         length is the signature of an under-determined calibration. Not a code
+         bug: a capture-guidance gap. This became P6.
+
+ 3.3  MODULE C - MOTION
+      CMD  python module_c_motion/optical_flow.py \
+                 --video data/smoke.mp4 --frame 0 --calibration ...
+      -> dense hand-built LK, OpenCV sparse LK and RANSAC affine all produced
+         and visualised.
+      Accuracy of the dense LK against known shifts, correlation length 10 px:
+           dx=3   err 0.09 px     Farneback 0.16
+           dx=8   err 1.68 px     Farneback 0.42
+           dx=16  err 9.38 px     Farneback 0.83
+      CONCLUSION
+        The hand-built dense LK is excellent for sub-pixel to ~3 px motion and
+        degrades sharply beyond that - inherent to the linearisation of dense
+        LK, not a coding error.  -> became P2.
+
+      NOTE, sign and magnitude corrected in section 9.3
+        The first pass wrote "the reported speed is roughly 21% low". That was
+        a misreading of its own error column. "dx=8 err 1.68 px" means the flow
+        ESTIMATOR READS 1.68 px where the truth is 8.0 px, so the flow is 21%
+        of true - i.e. 79% LOW, not 21% low. The error is far worse than the
+        first pass stated. Measured on the actual smoke clip texture the
+        single-level solve reads 1.58 px against a true 8.0 px, and it goes
+        NEGATIVE at 16 px. See 9.3.
+        true 8.0 px, an 80% error, and goes negative at 16 px. See 9.3.
+
+ 3.4  MODULE D - KALMAN TRACKING
+      CMD  python module_d_tracking/kalman_tracker.py \
+                 --video data/smoke.mp4 --output outputs/kalman
+      -> 1.76 s, 45 frames. Overlay video, trajectory plot, CSV, summary written.
+      Measured whole-run position RMSE against ground truth:
+           init v = 0      6.10 px   (raw measurements 1.60 px)
+           init v = true   1.12 px   (raw measurements 1.60 px)
+      45-frame clip: 4.77 px vs 1.40 px. 41 of 120 frames exceeded 2 px bias.
+      Raising process_noise barely helps (2.0 -> 6.40 px, 40.0 -> 5.70 px), and
+      the dt^4/dt^2 process-covariance fix does NOT help (6.37 px). Only the
+      initialisation matters.  -> became P1.
+
+      NOTE, superseded in section 9.2
+        The RMSE figures in this block are not reliable. Both boxes were scored
+        against a single box's geometry, and the fixture's two boxes differ in
+        size and in y, so the second box was being scored against a centre about
+        20 px from its true centre. Re-measured against per-box ground truth:
+        20.55 / 25.45 px unseeded and 0.72 / 0.71 px seeded. The qualitative
+        finding - that only the initialisation matters, and that process noise
+        and the dt^4/dt^2 fix do not - is unaffected and was confirmed again.
+
+ 3.5  MODULE E - RECOGNITION
+      CMD  python module_e_recognition/recognize.py \
+                 --data-root data/recognition --output outputs/recognition
+      -> trained and evaluated on three synthetic shape classes.
+      Held-out accuracy vs rotation:
+           0 deg   eigenbox 91.7%
+          15 deg   eigenbox 58.3%
+          30 deg   eigenbox 33.3%
+      The alignment classifier is computed on every call and then thrown away,
+      even though it is the rotation-robust one.  -> became P3.
+
+ 3.6  INTEGRATED PIPELINE
+      CMD  python pipeline.py --video data/smoke.mp4 ...
+      -> ran, but five separate defects were found. See section 5.
+
+
+--------------------------------------------------------------------------------
+ SECTION 4 : WHY SYNTHETIC FIXTURES
+--------------------------------------------------------------------------------
+ The brief requires real footage for the final submission. Real footage was not
+ available in this pass, so a synthetic clip with exactly known geometry was
+ generated (tools/make_test_video.py, 45 frames, two rectangles moving 8 px/frame
+ at 15 fps, i.e. a known 120 px/s). Fixtures were generated for calibration
+ (14 tilted, 6 fronto-parallel checkerboards) and recognition (3 classes x 12
+ crops).
+
+ The point is not to substitute for real footage. It is that without a known
+ answer there is no way to tell a working implementation from a plausible one,
+ and every one of the five bugs in section 5 was invisible to the passing test
+ suite and to visual inspection of the output.
+
+
+--------------------------------------------------------------------------------
+ SECTION 5 : CONFIRMED BUGS  (each reproduced with a command)
+--------------------------------------------------------------------------------
+
+ BUG 5  -- CRITICAL, FOUND LAST  --  pipeline CRASHES when --recognition-root is given
+   File   : module_e_recognition/recognize.py line 64-66  (_binary)
+   Code   : def _binary(image):
+                gray = np.clip(image * 255.0 if image.dtype == np.float32
+                               else image, 0, 255).astype(np.uint8)
+                _, binary = cv2.threshold(gray, 0, 255,
+                                          cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+   Cause  : the pipeline calls recognizer.predict(_crop(frame, box)) at
+            pipeline.py:162, and _crop() slices a COLOUR BGR video frame
+            (3-channel uint8). Because the dtype is uint8 and not float32,
+            the "* 255.0" branch is skipped, so `gray` stays 3-channel.
+            cv2.threshold with THRESH_OTSU requires a single channel.
+   Proof  :
+              cv2.error: ... in function 'cv::threshold'
+              THRESH_OTSU mode: 'src_type == CV_8UC1 || src_type == CV_16UC1'
+              where 'src_type' is 64 (CV_8UC3)
+            Traceback path: pipeline.py:162 -> recognize.py:198 -> 179 -> 66
+   Why the standalone CLI never shows it:
+            load_crops() reads with cv2.IMREAD_GRAYSCALE, so the CLI only ever
+            passes 1-channel images. prepare_crop() DOES convert BGR->GRAY,
+            which is why the alignment and eigenbox classifiers worked fine -
+            only HuMomentClassifier.features() -> _binary() was missing it.
+   Severity : this is the README's headline command:
+                python pipeline.py --video ... --calibration ... \
+                       --recognition-root data/recognition --output ...
+            It crashes. Without --recognition-root it works, which is why the
+            bug is easy to miss.
+   Fix    : add the channel conversion at the top of _binary():
+                if image.ndim == 3:
+                    image = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+   Effort : two lines
+
+ BUG 1  -- CRITICAL  --  pipeline --stride > 1 processes only ONE frame
+   File   : pipeline.py line 128
+   Code   : if processed % args.stride:
+                continue
+   Cause  : `processed` is incremented at the END of the loop body, and only
+            for frames that are KEPT. So after the first kept frame
+            processed == 1, and `1 % stride == 1` for every stride > 1,
+            so every remaining frame is skipped forever.
+   Proof  :  --stride 1 -> frames_processed = 45   (video has 45 frames)  OK
+             --stride 2 -> frames_processed = 1    BROKEN
+             --stride 3 -> frames_processed = 1    BROKEN
+   Fix    : use frame_index, not processed. module_d_tracking/kalman_tracker.py
+            line 89 already does this correctly:
+                if current_index % max(1, args.stride): continue
+   Effort : one line
+
+ BUG 2  --  pipeline never writes flow_preview.png
+   File   : pipeline.py line 146
+   Code   : if processed == 0:
+                save_image(output / "flow_preview.png", flow_to_color(flow))
+   Cause  : the enclosing block requires previous_frame is not None, which
+            only becomes true after `processed` has been incremented to >= 1.
+            So `processed == 0` can never be true here.
+   Proof  : outputs/pipeline/flow_preview.png exists: False
+            (checked for --stride 1 and --stride 2 runs)
+   Fix    : `if processed == 1:`
+   Effort : one line
+
+ BUG 3  --  pipeline writes speed=nan for the first 5 frames
+   File   : pipeline.py lines 120, 134
+   Cause  : latest_speed is initialised to float("nan") and flow only runs
+            when processed % flow_every == 0, so the first 5 processed frames
+            carry no speed value.
+   Proof  : total rows 135, rows with speed=nan: 15
+            distinct frames with nan: [0, 1, 2, 3, 4]
+   Fix    : either run flow from frame 1 (flow_every offset), or write an
+            empty string instead of nan, or document the gap in the README.
+   Effort : small
+
+ BUG 4  --  mean shift is not usable and is very expensive
+   File   : module_a_segmentation/segmentation.py line 200
+   Code   : distances = np.sum(
+                (features[:, None, :] - centers[None, :, :]) ** 2, axis=2)
+   Problem A: memory. This materialises a
+              (all pixels) x (n clusters) x 5 float64 array.
+              Measured on ONE 1920x1080 frame:
+                 time 24.91 s      peak python alloc 803 MB
+   Problem B: quality. On the smoke clip it hit the 30 box cap on every
+              frame and produced no coherent box.
+   Fix    : chunk the distance computation, or replace the assignment step
+            with a KD-tree / MiniBatchKMeans. If mean shift is only needed
+            for the comparison table, run it on a downscaled crop.
+   Effort : medium
+
+
+--------------------------------------------------------------------------------
+ SECTION 6 : ACCURACY WEAKNESSES  (no crash, but they cost marks)
+--------------------------------------------------------------------------------
+
+   P1  -- CRITICAL  --  Kalman filter ~40 frame startup transient
+   File   : module_d_tracking/kalman.py line 27
+   Code   : self.state[:] = [x, y, 0.0, 0.0]
+            self.covariance = np.diag([25.0, 25.0, 100.0, 100.0])
+   Cause  : velocity starts at 0, so the filter must spend ~40 frames
+            learning it. During that time the reported position lags badly.
+   Measured (see the correction below - these RMSE values are unreliable):
+             init v = 0      whole-run RMSE 6.10 px  (raw 1.60 px)
+             init v = true   whole-run RMSE 1.12 px  (raw 1.60 px)
+             45-frame clip: 4.77 px  vs  1.40 px
+             41 of 120 frames exceed 2 px bias
+   Note   : raising process_noise barely helps (2.0 -> 6.40 px,
+            40.0 -> 5.70 px), and the dt^4/dt^2 process-covariance fix does
+            NOT help (6.37 px). Only the initialisation matters.
+   CORRECTION, from section 9.2
+            The RMSE values above scored both boxes against one box's geometry.
+            The fixture's boxes differ in size and in y, so the second was scored
+            against a centre ~20 px from its true one. Corrected: 20.55 / 25.45 px
+            unseeded, 0.72 / 0.71 px seeded, peak unseeded error 44.5 px, and the
+            unseeded filter is STILL 11 px behind at the end of the clip. The
+            conclusion that only initialisation matters stands, and is stronger
+            than the numbers here suggested.
+   Fix    : when a track is created, seed the velocity from the displacement
+            between the current detection and the previous frame's matched
+            detection, and shrink P_vv accordingly. Module C already computes
+            a belt velocity estimate, which can be used directly.
+   Impact : 5x better on short clips; the tracker visibly stops "catching up"
+            in the annotated video.
+
+   NOTE, corrected in section 9.2
+     The fix above is necessary but NOT sufficient, and the "5x" figure is far
+     too conservative. Two reasons, both recorded in 9.2: gating the seed on the
+     association distance means it can never fire, and the first track of a clip
+     has no previous frame at all. Actual measured gain: ~28x, 20.55 -> 0.72 px,
+     and the unseeded filter is still 11 px behind when the clip ends - see 9.2,
+     which also corrects the first pass's 18.94 -> 0.13 px figures as a scoring
+     error.
+
+ P2  --  dense Lucas-Kanade is only valid for small inter-frame motion
+   File   : module_c_motion/lucas_kanade.py (whole module) and
+            pipeline.py line 136 which uses median_flow_vector for speed
+   Cause  : inherent to the dense LK linearisation, not a coding error.
+   Measured (corr length 10 px):
+              dx=3   err 0.09 px     Farneback 0.16
+              dx=8   err 1.68 px     Farneback 0.42
+              dx=16  err 9.38 px     Farneback 0.83
+    On the smoke clip (8 px/frame) the estimator reads 1.58 px, so the reported
+    flow is 20% of true, i.e. ~80% LOW.
+    Fix    : use the translation component of fit_affine_flow, which is far
+             more robust at larger motion (true 16 -> A-tx 13.35 vs
+             median 6.63). Optionally keep Farneback as a cross-check, since
+             the project already has the sparse LK path in optical_flow.py.
+    Effort : small, high value
+
+    NOTE, corrected in section 9.3
+      The fix above was implemented first and then REVERSED. fit_affine_flow fits
+      the same broken field, so it cannot rescue it - the fix has to be a
+      coarse-to-fine pyramid. And once the field is correct the median beats the
+      affine translation, so the estimator swap is no longer wanted. Effort was
+      also not "small": this was the largest single fix of the pass.
+
+   NOTE, corrected in section 9.3
+     This recommendation was implemented first and REVERSED. fit_affine_flow fits
+     the same broken field, so it cannot rescue it. The fix has to be a
+     coarse-to-fine pyramid. And once the field is correct, the median beats the
+     affine translation, so P2's estimator swap is no longer wanted.
+
+ P3  --  the shipped classifier is the least rotation-robust one
+   File   : module_e_recognition/recognize.py line 197
+   Code   : return { "label": eigen_label, "alignment_label": alignment_label, ... }
+   Problem: the alignment classifier result is computed every call and then
+            thrown away, even though alignment is the rotation-robust method.
+   Measured held-out accuracy vs rotation:
+              0 deg  eigenbox 91.7 %
+             15 deg  eigenbox 58.3 %
+             30 deg  eigenbox 33.3 %
+   Fix    : either return the alignment label, or combine the three by
+            majority vote / confidence weighting. Also consider adding more
+            rotated training samples.
+   Effort : small
+
+ P4  --  static dark regions become false-positive boxes
+   File   : module_a_segmentation/segmentation.py production_detections
+   Proof  : the dark belt strip (0,270,640x90) is returned as a detection on
+            every frame of the smoke clip, and becomes track ID 1 in the
+            pipeline with size 39.69 x 5.50 cm.
+   Cause  : Otsu + RETR_EXTERNAL accepts any large dark blob.
+   Fix    : reject detections that are nearly static across consecutive
+            frames, or require a minimum width/height, or exclude regions
+            touching the frame border. This matters a lot on real footage,
+            where shadows and gaps between rollers look exactly like this.
+   Effort : small
+
+ P5  --  plane homography is fitted to one view with least squares
+   File   : module_b_calibration/calibrate.py line 106
+   Code   : plane_homography, _ = cv2.findHomography(
+                image_points[0], object_points[0][:, :2], 0)
+   Problems:
+     - method 0 is plain least squares, no RANSAC, so one bad corner ruins
+       the whole homography.
+     - it is derived from image_points[0] ONLY, so it is valid only for that
+       exact board pose. Using it elsewhere gave 5.4-6.7 % size error in
+       testing (versus 0.005 % when used correctly). The CLI never warns
+       about this.
+   Fix    : switch to cv2.RANSAC with a reprojection threshold, and print an
+            explicit note that the homography is valid only for the first
+            board view / for objects lying on that plane.
+   Effort : small
+
+ P6  --  focal length unidentifiable from flat views
+   Evidence : a fronto-parallel-only calibration returned
+              fx = 743562 against a true 900.
+   Not a code bug, but a capture-guidance gap: data/README.md says to capture
+   the board "from different angles" without saying WHY or how much tilt is
+   needed.
+   Fix    : strengthen the capture instructions, and optionally have
+            calibrate.py warn when the pose spread is small (e.g. compare the
+            spread of tvec directions and warn if they are nearly parallel).
+   Effort : small (docs) / medium (warning)
+
+ P7  --  environment is on OpenCV 5.0.0, numpy 2.5.3, Python 3.14
+   All of these are very new relative to requirements.txt, which only pins
+   opencv-python-headless>=4.8 and numpy>=1.26. Everything currently passes,
+   but `findChessboardCornersSB` flag names were renamed in OpenCV 5
+   (CALIB_CB_EXHAUSTIVE is correct here; CALLIB_CB_EXHAUSTIVE does not exist).
+   Fix    : pin the upper bounds in requirements.txt so the project is
+            reproducible on a lab machine.
+   Effort : small
+
+ P8  --  unit tests are too weak
+   They use a pure gradient for the flow test, 32x32 solid blocks for the
+   classifier, and never assert a numeric accuracy threshold. They would pass
+   against a badly broken implementation.
+   Fix    : convert the ground-truth tests from this session into the test
+            suite - especially (a) LK accuracy at a known 3 px shift,
+            (b) Kalman steady-state RMSE with velocity seeded,
+            (c) homography size measurement on the fronto-parallel fixture.
+   Effort : medium
+
+
+--------------------------------------------------------------------------------
+ SECTION 7 : PRIORITISED ACTION LIST
+--------------------------------------------------------------------------------
+ Priority 1 - correctness bugs, one line each, do these first
+   [x] BUG 5  recognize.py:66      convert BGR->GRAY in _binary()
+                                   (fixes the README's main pipeline command)
+   [x] BUG 1  pipeline.py:128      use frame_index instead of processed
+   [x] BUG 2  pipeline.py:146      `if processed == 0` -> `if processed == 1`
+   [x] BUG 3  pipeline.py:120,134  handle the nan speed on the first frames
+
+ Priority 2 - biggest accuracy wins
+   [x] P1     kalman.py:27          seed velocity at track creation
+                                    (measured ~28x, 20.55 -> 0.72 px, see 9.2)
+   [x] P2     pipeline.py:136       dense LK coarse-to-fine pyramid
+                                   (estimator swap from the original list was
+                                   reversed, see 9.3)
+   [x] P3     recognize.py:197      ensemble vote with alignment tie-break
+
+ Priority 3 - robustness on real footage
+   [x] P4     segmentation.py       reject static false-positive regions
+   [x] P5     calibrate.py:106      RANSAC + warn about view-0 homography
+   [x] BUG 4  segmentation.py:200   chunk the mean-shift distance computation
+
+ Priority 4 - reproducibility and defensibility
+   [x] P6     data/README.md        explain WHY varied tilt is needed
+   [x] P7     requirements.txt      pin upper version bounds
+   [x] P8     tests/                promote the ground-truth tests to the suite
+   [x] README.md                   state the measured accuracy numbers and
+                                   which segmentation method was chosen and why
+
+ Items (c) from P8, the fronto-parallel calibration fixtures, are the one part
+ not carried out; the reason is recorded in 9.10.
+
+
+--------------------------------------------------------------------------------
+ SECTION 8 : STATUS AT THE END OF THE AUDIT PASS
+--------------------------------------------------------------------------------
+ DONE
+   [x] Environment and dependency check
+   [x] Static verification (pytest, compileall, ruff) - all pass
+   [x] Full read of all 16 source files across 6 packages
+   [x] Module A executed and compared against ground truth
+   [x] Module B executed, intrinsics and measurement validated
+   [x] Module C executed, accuracy characterised vs displacement and noise
+   [x] Module D executed, transient isolated and root-caused with an oracle test
+   [x] Module E executed, rotation robustness measured
+   [x] Integrated pipeline executed
+   [x] 5 confirmed bugs reproduced with commands
+   [x] 8 prioritised findings written up
+
+   Late addition, found during the final full re-run:
+   [x] BUG 5 found and fixed-in-memory - the pipeline crashes whenever
+       --recognition-root is supplied, because _binary() does not convert a
+       3-channel BGR crop before cv2.threshold + THRESH_OTSU. This is the
+       command shown in the README's "Integrated pipeline" section.
+
+ NOT DONE
+   [ ] No code changes had been made yet (deliberately - the report is the
+       deliverable for that pass, so the fixes could be reviewed first)
+   [ ] Real footage has not been used. The brief requires real video for the
+       final submission; everything above uses synthetic fixtures.
+   [ ] No accuracy numbers exist yet for the real deliverable, only for the
+       synthetic controls.
+
+ FILES ADDED TO THE REPOSITORY (fixtures only, no source changes)
+   data/calib_fixture/         14 png   synthetic checkerboards
+   data/calib_frontoparallel/   6 png   fronto-parallel checkerboards
+   data/recognition/round/     12 png
+   data/recognition/square/    12 png
+   data/recognition/triangle/  12 png
+   outputs/calib_fixture.npz         fixture calibration
+
+ FILES CHANGED IN THE FIRST PASS
+   none. No source file was modified.
+
+================================================================================
+
+
+================================================================================
+ SECTION 9 : FIX PASS  -  APPLYING THE PRIORITISED LIST
+================================================================================
+ Date   : 2026-09-29 (same day, after the report above was written)
+ Scope  : Priority 1 and 2 in full, plus P4/P5/P6/P7/P8 from Priority 3/4.
+ Method : every fix was re-measured against ground truth before and after.
+           Claims below are measured, not estimated.
+
+--------------------------------------------------------------------------------
+ 9.1  CORRECTNESS BUGS  (Priority 1)  -  ALL FOUR FIXED
+--------------------------------------------------------------------------------
+
+ BUG 5  --  FIXED  recognize.py _binary()
+   Change : convert BGR to grey at the top of _binary(), before the Otsu call.
+   Test   : test_hu_moments_accept_a_colour_crop, and a second test asserting a
+            3-channel crop thresholds to exactly the same bitmap as its own grey
+            conversion. This is the bug that crashed the README's headline
+            command whenever --recognition-root was supplied.
+   Verify : python pipeline.py ... --recognition-root data/recognition now runs
+            to completion and writes a summary with recognition_enabled true.
+
+ BUG 1  --  FIXED  pipeline.py stride
+   Change : `if frame_index % args.stride` instead of `processed % args.stride`.
+   Verify : --stride 1 -> 45 frames, --stride 2 -> 23, --stride 3 -> 15.
+            Previously 2 and 3 both produced 1.
+
+ BUG 2  --  FIXED  pipeline.py flow_preview
+   Change : the guard is `(processed - 1) % flow_every == 0`, and the preview is
+            written when `processed == 1`.
+   Verify : flow_preview.png exists for --stride 1, 2 and 3. It never existed
+            before.
+
+ BUG 3  --  FIXED  pipeline.py nan speed
+   Change : the flow schedule now starts on the first frame that has a previous
+            frame available, so the blank window shrank from 5 frames to 1.
+            Unavailable speeds are written as an empty CSV cell, printed as
+            "n/a", and drawn as "speed=n/a cm/s" instead of "speed=nan cm/s".
+   Verify : 0 blank rows when a scale is supplied -- with --cm-per-pixel 0.05 all
+            88 rows carry a speed, versus 15 nan rows before the fix. The
+            remaining blank case is deliberate: with neither --calibration nor
+            --cm-per_pixel there is no pixel-to-cm scale at all, so every row is
+            blank and says n/a rather than inventing a number.
+
+   This one interacts with P4 and is worth stating together. P4 withholds the
+   first measurement from the tracker, so the first tracked frame is now frame 1
+   -- which is exactly the frame the first flow estimate exists for. The two
+   fixes removed the same blank window from opposite ends, which is why the
+   result is 0 rather than the 1 frame either would leave on its own.
+
+--------------------------------------------------------------------------------
+ 9.2  P1  --  KALMAN STARTUP  -  FIXED, ~28x BETTER, AND THE NUMBERS RE-MEASURED
+--------------------------------------------------------------------------------
+ The log above attributed the transient to `self.state[:] = [x, y, 0, 0]`
+ at kalman.py:27 and recommended seeding from the previous frame's detection.
+ Implementing that alone did NOT work, and the reasons are worth recording:
+
+   Attempt 1 - seed from the previous frame, gated on association_distance.
+     No effect. A new track is created precisely BECAUSE the object failed
+     association, so by construction the nearest previous detection is always
+     farther away than the gate. The gate could never fire.
+
+   Attempt 2 - widen the gate (seed_distance, default 3x association).
+     Helped, but only for tracks created mid-run. The first track of a clip is
+     created on frame 0, where no previous measurement exists at all.
+
+   Attempt 3 - an explicit `initial_velocity` on the tracker, for frame 0.
+     This is the part that actually matters. Supplied by --belt-velocity VX VY
+     in pixels per second, in both pipeline.py and kalman_tracker.py.
+
+ Also corrected while in there: my first attempt widened the initial covariance
+ to position_std 25 / velocity_std 100, which is LOOSER than the original
+ diag(25,25,100,100) and made convergence slower. Restored to 5.0 / 10.0, and
+ the seeded-velocity uncertainty is now derived from the measurement noise and
+ the frame interval rather than being a magic number.
+
+ MEASURED, 45-frame smoke clip, true motion 8 px/frame at 15 fps = 120 px/s.
+ Ground truth is per box, and the two boxes are NOT the same size:
+   box 1  (50+8i, 115) to (140+8i, 235)   centre (95+8i, 175)
+   box 2  (310+8i, 90) to (425+8i, 220)   centre (367.5+8i, 155)
+ Frames where a box is clipped by the 640 px frame edge are excluded, because a
+ clipped contour no longer has the ideal centre.
+
+                        no seed        seed 120 px/s     ratio
+     box 1              20.55 px         0.72 px        28x
+     box 2              25.45 px         0.71 px        36x
+
+ THE ERROR PROFILE MATTERS MORE THAN THE RMSE. Unseeded, per frame:
+
+     f1     f2     f3     f4     f5     f6     f7     f8
+    0.71   4.61   8.96  12.91  20.80  28.69  36.58  44.47   <- peak 44.5 px
+    f9    f12    f16    f20    f24    f28    f32
+   37.27  29.96  26.44  22.70  18.55  14.64  11.21          <- still 11.2 px
+
+ The unseeded filter is still 11 px behind and decaying about 1 px per frame
+ when the 45-frame clip ends. It does not converge within the clip at all. So
+ this is not a 40-frame "transient" that settles - it is a long lag, peaking at
+ 44.5 px, which is more than five frames of motion for an object moving 8 px per
+ frame. The tracker is reporting where the box was five frames ago.
+
+ The seeded run is flat at 0.71-0.72 px from the first tracked frame, worst
+ single frame 0.81 px. So the fix does not shorten the recovery, it removes it.
+
+ CORRECTION TO AN EARLIER VERSION OF THIS SECTION
+   The first write-up of this fix quoted "18.94 -> 0.13 px" and "23.37 -> 0.50 px"
+   and derived a "140x" headline. Both ends of that comparison were wrong, and
+   they were wrong in a way worth recording because it looked fine.
+
+   The 18.94 / 23.37 unseeded figures came from scoring BOTH boxes against box 1's
+   geometry. Box 2 is a different size and a different y, so it was being scored
+   against a centre 20 px away from its real centre - most of the 23.37 px was my
+   own scoring error, not tracking error. The 0.13 / 0.50 seeded figures are not
+   reproducible end to end at all; run against the corrected ground truth the
+   seeded clip measures 0.72 / 0.71.
+
+   The direction and the size of the effect are unchanged - seeding is worth
+   roughly 28-36x and eliminates a multi-frame lag. But "140x" was an artefact of
+   a broken measurement, and the honest headline is ~28x.
+
+--------------------------------------------------------------------------------
+ 9.3  P2  --  DENSE LUCAS-KANDE  -  FIXED AT THE ROOT, AND P2's FIX REVERSED
+--------------------------------------------------------------------------------
+ P2 as written in the log said: "use the translation component of
+ fit_affine_flow, which is far more robust at larger motion (true 16 ->
+ A-tx 13.35 vs median 6.63)."
+
+ I implemented that first, and it did not deliver. Measuring the underlying flow
+ field rather than the estimator on top of it showed why:
+
+   true shift, single-level dense LK, median over valid pixels:
+        1 px ->  1.00        3 px ->  2.75
+        8 px ->  3.60       16 px -> -4.36
+
+ The field is not merely noisy at 8 px, it is wrong by more than half, and it
+ goes NEGATIVE at 16 px. Note this contradicts the log's own figure of "8 px ->
+ 1.68 px error" measured against a 10 px correlation length; on the smoke clip's
+ much sparser texture the error is far worse. On the smoke clip the single-level
+ median reports 1.58 px against a true 8.0 px - an 80% underestimate, not the
+ 21% the log recorded.
+
+ Root cause is the ordinary one: brightness constancy is linearised around zero
+ displacement, so a single-level solve is only valid for motion well inside one
+ window width. fit_affine_flow cannot rescue this, because it fits the same bad
+ field. It just fits it with less noise.
+
+ FIX: coarse-to-fine Lucas-Kanade. The frames are put on a Gaussian pyramid and
+ the solve runs coarse to fine, each level refining the previous level's flow
+ warped onto the current level. `_dense_level` now takes an initial guess and
+ warps the next frame by it before computing the residual, which is the standard
+ formulation. Level count is automatic, capped so the coarsest level still has
+ at least one full window of pixels; `max_levels` defaults to 5.
+
+ MEASURED, known rigid shift of a textured synthetic frame, median flow:
+
+   shift    1     2     3     5     8    12    16    24
+   error  0.00  0.00  0.00  0.00  0.01  0.01  0.15  0.02
+
+ Same measurement at 240x320, 180x320 and 120x160 agrees, so the automatic level
+ choice is not tuned to one resolution.
+
+ On the smoke clip: 1.58 px -> 8.04 px against a true 8.0 px, i.e. 80% error
+ down to 0.5%. End-to-end the pipeline's reported belt speed goes from 1.18 cm/s
+ to 6.07 cm/s against a true 6.00 cm/s.
+
+ THE SCALE IS A SEPARATE MATTER, and worth being explicit about because it is
+ easy to misread. Pixel flow and cm/s are independent: 8.04 px/frame at 15 fps is
+ 120.6 px/s, and cm/s is that multiplied by a cm-per-pixel scale.
+
+   --cm-per-pixel 0.05        ->  6.032 cm/s   the fixture's true scale
+   --calibration calib_fixture.npz -> 7.479 cm/s   the checkerboard scale
+
+ The 0.05 cm/px is the ground truth of the synthetic clip. The 0.062 cm/px implied
+ by the checkerboard calibration is 24% larger, because the checkerboard fixture
+ and the synthetic video are unrelated geometries - the calibration was fitted to
+ 2.5 cm squares on a board that has nothing to do with the boxes in the clip.
+ Using it to scale the flow bakes in a 24% scale error that has nothing to do with
+ the flow fix. So every speed accuracy claim in this section is quoted against
+ the true scale, and the calibrated run is reported separately as an end-to-end
+ integration check rather than as a flow-accuracy measurement.
+
+ P2's RECOMMENDATION REVERSED: with the field fixed, the median is the better
+ estimator and fit_affine_flow is now only a fallback for a degenerate field
+ (all-zero or non-finite), because on the smoke clip it reads 7.52 px against
+ the median's 8.03 px. The log's comparison was made on a broken flow field, so
+ its conclusion did not survive the fix that preceded it.
+
+ Farneback is retained only as a cross-check, reported in flow_metrics.json.
+
+--------------------------------------------------------------------------------
+ 9.4  P3  --  RECOGNITION ENSEMBLE  -  FIXED
+--------------------------------------------------------------------------------
+ Change : new VotingClassifier, majority vote over alignment, eigenbox and Hu
+          with the rotation-robust alignment classifier breaking ties.
+          RecognitionEngine.predict now returns the voted label, and
+          ensemble_vote / ensemble_vote_rotated_15deg rows were added to the
+          accuracy table so the shipped decision rule is measured like any other.
+
+ MEASURED on the bundled three-class fixtures:
+
+   method                       held-out    rotated 15 deg
+   alignment                       91.7%            -
+   eigenbox_pca                    91.7%            -
+   hu_moments                      50.0%          50.0%
+   ensemble_vote                   91.7%          75.0%
+
+ The ensemble matches the best single method when upright and holds 75.0% under
+ rotation, where eigenbox alone was the 58.3% figure from the log. Modest but
+ real, and it is now measured rather than assumed.
+
+--------------------------------------------------------------------------------
+ 9.5  BUG 4  --  MEAN SHIFT MEMORY  -  FIXED
+--------------------------------------------------------------------------------
+ Change : chunked assignment via `_nearest_center_labels`, using the
+          ||c||^2 - 2 x.c expansion so only a (chunk x clusters) matrix is live.
+
+ MEASURED on one 1920x1080 frame:
+                      before        after
+   time                24.91 s      10.35 s
+   peak python alloc    803 MB       101 MB
+
+ Mean shift still hits the 30-box cap on every frame, so it remains
+ comparison-only. segmentation_notes.txt now says so with numbers.
+
+--------------------------------------------------------------------------------
+ 9.6  P4  --  STATIC FALSE POSITIVES  -  FIXED, AFTER AN INCOMPLETE FIRST TRY
+--------------------------------------------------------------------------------
+ The log's evidence: the dark belt strip at (0,270) 640x90 is returned as a
+ detection on every frame, with its centre at exactly (320.0, 315.0) on all of
+ them, and it became track ID 1 measuring 39.69 x 5.50 cm.
+
+ Step 1 - reject static measurements.
+   Change : `reject_static_detections` drops a detection whose centre is within
+            2 px of a detection in the previous frame. A box on a moving belt
+            shifts 8 px/frame on the smoke clip, so a near-zero displacement is
+            a reliable static-background cue. Wired into pipeline.py with
+            --keep-static to disable.
+   This works at the measurement level: the belt is correctly rejected on every
+   frame from 1 onward.
+
+ Step 2 - the track still appeared, and the first write-up of this fix claimed
+          it did not. It did not. Measured:
+
+              before any fix     3 tracks, 135 records
+              after step 1       3 tracks, 121 records
+
+   Track ID 1 was still there, merely cut from 45 frames to 31. The record count
+   drop is easy to misread as "the false positive is gone" when in fact the
+   phantom track survives and simply coasts out of its confirmation window
+   sooner, because the measurements that would have kept it alive are gone.
+   Suppressing a false measurement is not the same as suppressing a false track.
+
+ Step 3 - the actual fix: do not create a track until moving is observable.
+   On frame 0 there is no previous frame, so a static region and a real box are
+   literally indistinguishable. The first measurement is therefore withheld
+   from the tracker and detection starts on frame 1. One frame (67 ms at 15 fps)
+   of latency is a far better trade than a 31-frame phantom track.
+
+   Applied in both entry points, pipeline.py and module_d_tracking/kalman_tracker.py,
+   because the standalone tracker is the module that produced the original
+   finding and it was still emitting the false positive after step 1.
+
+   A second, subtler bug surfaced while wiring this up: previous_detections must
+   hold the RAW detections, not the post-filter list. Storing the filtered list
+   means a detection rejected on frame N is absent on frame N+1, so the
+   comparison finds nothing, re-admits it, and the track is created and dropped
+   on alternate frames. That produced 22 tracks. pipeline.py already stored the
+   raw list; kalman_tracker.py did not.
+
+ Step 4 - the two entry points had grown their own copy of this decision, and had
+          already drifted once (step 2's raw-vs-filtered bug existed in
+          kalman_tracker.py and not in pipeline.py). Extracted as
+          `select_tracking_detections` in module_a_segmentation/segmentation.py,
+          which owns reject_static_detections, and both entry points now call it.
+          The 2-px static threshold, the raw-vs-filtered rule and the
+          first-frame withholding are defined once.
+
+   VERIFIED that the new tests are load-bearing rather than decorative: deleting
+   the first-frame withholding from select_tracking_detections makes
+   test_static_background_never_becomes_a_track fail with 2 tracks instead of 1.
+   A regression test that still passes against the broken code is what section
+   2 criticised about the original suite, so it was checked rather than assumed.
+
+ VERIFIED after step 3, smoke clip:
+              before any fix     3 tracks, 135 records
+              after step 1       3 tracks, 121 records   (phantom persists)
+              after step 3       2 tracks,  88 records   (phantom gone)
+
+   The two surviving tracks are the two real boxes, each present on 44 of 45
+   frames - the missing frame is frame 0, which is the intended cost.
+   --keep-static restores the original 3 tracks at 45 rows each, so the flag is
+   not silently inverting the fix.
+
+ Caveats, stated because they are real:
+   - A genuinely stationary box is also dropped. On a moving conveyor that is
+     the correct trade; on a stopped line it would suppress real detections.
+     That is why it is a flag rather than unconditional.
+   - A stationary object that starts moving is picked up one frame after it
+     starts, not before.
+
+--------------------------------------------------------------------------------
+ 9.7  P5  --  PLANE HOMOGRAPHY  -  FIXED
+--------------------------------------------------------------------------------
+ Change : cv2.findHomography now uses RANSAC with a 3.0 px reprojection
+          threshold instead of plain least squares, and warns when fewer than
+          90% of corners are inliers. calibrate.py prints an explicit note that
+          the homography comes from the first view only and is valid for objects
+          on that plane.
+
+ VERIFIED on both fixture sets: no inlier warning on either, and the fixture
+ intrinsics are unchanged (fx 897.2 against a true 900, was 897.2 before).
+
+--------------------------------------------------------------------------------
+ 9.8  P6  --  FOCAL LENGTH UNIDENTIFIABLE  -  FIXED
+--------------------------------------------------------------------------------
+ Change : `_board_normal_spread` computes the largest angle between the optical
+          axes of the captured views; calibrate.py warns below 10 degrees.
+
+ VERIFIED on the fronto-parallel fixture, which is exactly the failure case the
+ log described:
+
+   WARNING: the captured board views differ by only 0.0 deg. Focal length and
+   distortion are not identifiable from near-identical view directions; retake
+   the board tilted roughly 20-45 deg in several directions.
+
+ The fx it then reports, 743562 against a true 900, is now visibly flagged as
+ meaningless rather than silently wrong. On the properly tilted fixture the
+ spread is 11.6 deg and no warning fires. data/README.md explains why tilt is
+ required, not just that it is.
+
+--------------------------------------------------------------------------------
+ 9.9  P7  --  REPRODUCIBILITY  -  FIXED
+--------------------------------------------------------------------------------
+ Change : upper bounds added to every line of requirements.txt. This machine has
+          OpenCV 5.0.0, NumPy 2.5.3 and Python 3.14, all far newer than the
+          previous lower-bound-only pins. CALIB_CB_EXHAUSTIVE is the OpenCV 5
+          spelling; an unbounded install on an older machine would fail there.
+
+--------------------------------------------------------------------------------
+ 9.10 P8  --  WEAK TESTS  -  FIXED
+--------------------------------------------------------------------------------
+ The log's complaint was exact: the old suite used a pure gradient for the flow
+ test, 32x32 solid blocks for the classifier, and never asserted a numeric
+ accuracy threshold, so it would pass against a badly broken implementation.
+
+ Replaced with ground-truth tests, 4 -> 19:
+
+   - Lucas-Kanade recovers a known 1/3/8/16 px shift to under 0.35 px, driven
+     from a shared band-limited texture helper rather than a bare gradient.
+   - Lucas-Kanade survives a 24 px displacement to under 1 px, which is the case
+     that failed before the pyramid.
+   - Lucas-Kanade returns no NaNs on a flat frame.
+   - Seeded vs zero velocity initialisation, asserted directly against each other
+     plus an absolute bound tied to the 1 px noise floor.
+   - Tracker RMSE with a known belt velocity vs without, on a 45-frame clip.
+   - A track created mid-clip starts with a non-zero velocity.
+   - Hu-moment classifier accepts a 3-channel crop (the BUG 5 regression), and
+     agrees exactly with the grey conversion of the same crop.
+   - A static background region never becomes a track, driven through the real
+     `select_tracking_detections` rather than a reimplementation of it (P4).
+   - The first-frame withholding is load-bearing: asserted by showing that
+     WITHOUT it the belt survives as a second track.
+   - The static filter keeps a box that genuinely moves, so it cannot silently
+     become a general box-destroyer.
+   - --keep-static restores the unfiltered behaviour, so the flag is not dead.
+
+ Each accuracy assertion is paired with the measurement that justifies its
+ threshold, so a future regression shows up as a number rather than a mystery.
+ The four P4 tests are the only ones added after the fact rather than promoted
+ from the audit pass, and they were written after 9.6 revealed that the first
+ version of that fix was incomplete. Their value was checked by deleting the fix
+ and confirming they fail - see 9.6 step 4.
+
+ Two calibration-fixture tests from the log's P8 list are NOT included: they need
+ a calib_front.npz artifact, which is regenerable rather than checked in, and a
+ test that silently skips is worse than no test. The homography behaviour is
+ instead covered by the RANSAC inlier warning, verified manually above.
+
+ A NOTE ON WHERE THE KALMAN NUMBERS CAME FROM
+   The in-suite tracker test (test_tracker_with_a_known_belt_velocity) scores a
+   SINGLE synthetic box with zero noise on its first frame, and asserts
+   seeded < 0.6 px. It measures 0.13 px. That is where the 0.13 and 0.50 figures
+   in the first version of section 9.2 came from - a unit test, not the smoke
+   clip. The smoke clip, with real detections, clipped boxes and a per-box ground
+   truth, measures 0.72 / 0.71. Same fix, different measurement, and the two
+   were conflated.
+
+--------------------------------------------------------------------------------
+ 9.11  FULL VERIFICATION SWEEP
+--------------------------------------------------------------------------------
+   python -m pytest -q
+     19 passed
+
+   python -m ruff check .
+     All checks passed!
+
+   python -m compileall -q common module_a_... module_e_... pipeline.py tools
+     clean
+
+ Every module re-run end to end after the changes:
+   A  run_segmentation.py     ok, notes regenerated with measured timings
+   B  calibrate.py            ok, both fixture sets, warnings as expected
+    C  optical_flow.py         ok, 8.04 px against a true 8.0
+                              (6.032 cm/s at the true 0.05 cm/px scale)
+    D  kalman_tracker.py       ok, 2 tracks, RMSE 20.55/25.45 -> 0.72/0.71
+   E  recognize.py            ok, ensemble 91.7% / 75.0% rotated
+   +  pipeline.py             ok with and without --recognition-root,
+                               --calibration, and at --stride 1/2/3
+      --stride 1 -> 45 frames, 88 records, flow_preview written
+      --stride 2 -> 23 frames, 44 records, flow_preview written
+      --stride 3 -> 15 frames, 28 records, flow_preview written
+      --calibration calib_fixture.npz + --recognition-root: calibrated true,
+      recognition_enabled true, 2 tracks, 88 records
+      speed with --cm-per-pixel 0.05: all 88 rows populated, range
+      6.0066-6.0742 cm/s against a true 6.000 (0.1% to 1.2% high)
+
+--------------------------------------------------------------------------------
+ 9.12  WHAT IS STILL NOT DONE
+--------------------------------------------------------------------------------
+   [ ] REAL FOOTAGE. The brief requires it. Everything above is measured on
+       synthetic fixtures with known ground truth, which is the only reason any
+       of these numbers exist. Nothing here proves behaviour on real video.
+
+   [ ] No absolute accuracy claim for the final deliverable yet. The numbers in
+       this section are relative, against controls.
+
+   [ ] The static-detection filter drops genuinely stationary boxes. Correct on a
+       moving conveyor, wrong on a stopped line.
+
+   [ ] Recognition accuracy is 91.7% on three synthetic shape classes. Real box
+       classes will be harder and the split is small (12 crops per class).
+
+   [ ] Plane homography is still fitted to one view. That is a limitation of the
+       approach, now documented and warned about, not fixed.
+
+   [ ] Tests do not cover the calibration fixtures end to end, for the reason
+       given in 9.10.
+
+ RESOLVED DURING THIS PASS, recorded here so they are not re-opened
+   [x] No regression test for P4. RESOLVED in 9.6 step 4: the static filter and
+       the first-frame withholding are now covered by four tests that call the
+       real `select_tracking_detections`, and those tests were confirmed to fail
+       when the fix is removed.
+
+   [x] The two entry points duplicated the static-filter and first-frame logic
+       and could drift apart. RESOLVED in 9.6 step 4: extracted as
+       `select_tracking_detections` and shared.
+
+   [x] The Kalman accuracy figures in 9.2 were not reproducible. RESOLVED:
+       re-measured against per-box ground truth, with the cause identified as
+       scoring both boxes against one box's geometry.
+
+================================================================================
+ END OF WORK LOG
+================================================================================

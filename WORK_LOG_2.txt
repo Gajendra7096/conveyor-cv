@@ -1,0 +1,479 @@
+CONVEYOR CV - TASK LIST AND WORK LOG
+Project : Camera-Based Conveyor Inspection & Tracking System
+Location: D:\CV\conveyor_cv
+Brief   : D:\CV\Building a Camera-Based Conveyor Inspection & Tracking System.pdf
+Date    : 2026-09-30
+Python  : 3.14.7 / OpenCV 5.0.0 / NumPy 2.5.3 / scikit-image 0.26.0 / scikit-learn 1.9.1
+
+
+================================================================================
+SECTION 1 : BRIEF REQUIREMENTS VS. CODE - GAP ANALYSIS
+================================================================================
+The brief is 4 pages. Deliverable: working code + 10-minute screen-recorded demo
++ a 1-page README. Five modules (A-E) chained into one pipeline.py.
+
+--------------------------------------------------------------------------------
+1.1 MODULE A - SEGMENTATION (finding boxes per frame)
+--------------------------------------------------------------------------------
+REQUIRED                                  STATUS ON ARRIVAL
+Run >=4 of 6 methods on the same 5 frames DONE - split_merge, watershed,
+                                         felzenszwalb, mean_shift
+Grid image comparing all methods           DONE - segmentation_comparison.png
+3-4 sentences in CODE COMMENTS on which   PARTIAL - prose was in
+method handled touching/overlapping       segmentation_notes.txt, a .txt file,
+boxes best and why                        not code comments, and the claim was
+                                         FALSE (see 1.6)
+Region graph inspection (Felzenszwalb)    NOT DONE (brief says "implement or
+                                         use ... and inspect the region graph")
+Normalized Cut (7th, optional)           NOT DONE - not needed, 4 methods
+                                         already exceeds the ">=4 of 6" bar
+
+--------------------------------------------------------------------------------
+1.2 MODULE B - CALIBRATION (pixels to centimetres)
+--------------------------------------------------------------------------------
+REQUIRED                                  STATUS ON ARRIVAL
+calibrateCamera -> K + distortion         DONE
+Undistort a sample, show before/after     DONE - undistortion.png
+Extrinsics + MANUAL decomposition of      DONE - _decompose_projection uses
+P = K[R|t]                                scipy rq, prints K, R, t back out
+Four camera models (ortho / weak-persp /  DONE - estimate_box_size returns all
+affine / full-perspective)                four
+2-3 sentences in CODE COMMENTS on which   MISSING - measure_box.py printed four
+model is most accurate and why, given     numbers with no analysis at all. There
+the camera's FOV and object distance      was no ground truth, so no claim could
+                                         be made honestly.
+
+--------------------------------------------------------------------------------
+1.3 MODULE C - MOTION (how fast is the belt moving)
+--------------------------------------------------------------------------------
+REQUIRED                                  STATUS ON ARRIVAL
+Hand-built dense Lucas-Kanade, not just   DONE - _dense_level solves the 2x2
+cv2.calcOpticalFlowPyrLK                 system, plus a coarse-to-fine pyramid
+Visualise flow field as arrows            DONE - visualize_flow
+Compare against OpenCV SPARSE flow and    PARTIAL - both were computed and saved,
+DISCUSS where they disagree (aperture     but the required discussion of the
+problem) in comments                      disagreement did not exist anywhere
+6-parameter affine fit + RANSAC, show     DONE - fit_affine_flow, inliers drawn
+inlier/outlier split visually             green, outliers red
+Real-world speed in cm/s from Module B    DONE - estimate_speed, verified
+                                         6.032 cm/s against a true 6.000
+
+--------------------------------------------------------------------------------
+1.4 MODULE D - KALMAN TRACKING
+--------------------------------------------------------------------------------
+REQUIRED                                  STATUS ON ARRIVAL
+Kalman from scratch, state                DONE - ConstantVelocityKalman
+[x, y, vx, vy], constant velocity          (predict/update written out, no
+                                          library call)
+Use Module A output as noisy              DONE - but on the bundled smoke clip
+measurements each frame                    the measurements are NOISE-FREE, so
+                                          the filter was a mathematical no-op
+PRINT predicted position, raw noisy       MISSING - the cycle was never
+measurement and corrected estimate for    printed. predicted/measure/correct
+>=10 consecutive frames                    all existed only implicitly in state.
+Simulate dropout for 3-5 frames, show     DONE - 4 frames, overlay + plot
+pure-prediction tracking
+Plot raw vs filtered on the same axes     DONE - tracking_plot.png
+
+--------------------------------------------------------------------------------
+1.5 MODULE E - RECOGNITION
+--------------------------------------------------------------------------------
+REQUIRED                                  STATUS ON ARRIAL
+>=3 classes, ~10 crops each              DONE - 3 classes x 12 crops
+Alignment (keypoints + homography,        DONE - AlignmentClassifier, ORB +
+residual error)                           findHomography + residual
+PCA eigenboxes, show top-3 eigenvectors   DONE - eigenvectors.png
+>=1 invariant feature (Hu moments) that   DONE - HuMomentClassifier, measured
+discriminates even when rotated           50% rotated vs 50% upright
+Accuracy for BOTH alignment and           DONE - accuracy_table.csv
+eigenspace on a held-out set
+NOTE which method is more robust to       MISSING - only rotation was ever
+LIGHTING changes vs. rotation              tested. Lighting was never measured,
+                                         so the required note could not be
+                                         written honestly.
+
+--------------------------------------------------------------------------------
+1.6 INTEGRATION AND DOCUMENTATION
+--------------------------------------------------------------------------------
+pipeline.py chaining A -> D -> B -> C -> E DONE - all five stages wired
+Prints per tracked box: ID, size cm,      DONE
+speed cm/s, recognized type
+README: how to run each module            DONE
+README: max-5-sentence note per module    MISSING - no per-module
+on WHAT IT DEMONSTRATES                   "what it demonstrates" notes
+UI                                       NOT REQUIRED by the brief ("it does
+                                         not need a polished UI") but
+                                         explicitly requested by the user
+
+
+================================================================================
+SECTION 2 : DEFECTS FOUND BY MEASUREMENT (not by reading)
+================================================================================
+
+DEFECT 1 - FALSE DOCUMENTATION CLAIM, MODULE A  (severity: high, it misleads)
+--------------------------------------------------------------------------------
+FOUND   : segmentation_notes.txt and README.md both state "Chosen for the
+          pipeline: watershed, because it is the only method here that both finds
+          the few real boxes and stays fast, and it is the one that separates
+          touching boxes via distance-transform markers."
+REALITY : watershed_segmentation() is NOT the downstream detector.
+          production_detections() - the function pipeline.py and
+          kalman_tracker.py actually call - uses Otsu + morphological open/close +
+          findContours(RETR_EXTERNAL). It never calls watershed at all.
+IMPACT  : the notes name a method the pipeline does not use, and attribute
+          touching-box separation to it, which the measurement below shows is
+          false. A reviewer who read the notes and then read the code would find
+          the code does not match its own documentation.
+
+DEFECT 2 - WATERSHED MARKER GENERATION HAS A REAL BUG  (severity: medium)
+--------------------------------------------------------------------------------
+FOUND   : watershed_segmentation() computes markers as
+              threshold = max(2.0, distance.max() * 0.45)
+          over the WHOLE FRAME, from one distance transform of the whole binary
+          foreground.
+WHY     : on any frame where a dark region touches the frame border, the distance
+          transform of that region grows toward the border and its maximum lands in
+          a corner, far larger than the inradius of a real box. Measured on a
+          640x360 frame with a belt strip 640x88 at the bottom: belt dist max
+          = 90.0 px, the two boxes' inradius = 63.0 px. One global threshold of
+          0.45 x 90.0 = 40.5 then sits above neither box's usable marker scale, so
+          a small box and a huge border-touching region are forced to share a
+          threshold that suits neither.
+STATUS  : investigated, NOT changed. See 2.2 for why the obvious fix is worse.
+
+DEFECT 3 - MODULE D's CORE DEMONSTRATION WAS INVISIBLE  (severity: high)
+--------------------------------------------------------------------------------
+FOUND   : the bundled synthetic clip has pixel-exact box edges, so
+          production_detections() returns a measurement with zero noise. With a
+          zero-noise measurement the Kalman posterior equals the measurement, so
+          printed predicted / measured / corrected values are all identical and
+          the filter appears to do nothing.
+MEASURED: at --measurement-noise 1.5 the three stages visibly differ, e.g.
+            frame 2  predict (111.50, 175.95)
+                     measure (110.82, 174.01)
+                     correct (111.25, 175.24)
+          The brief's premise is "noisy position measurements", so the noise had
+          to be representable to demonstrate anything at all.
+
+DEFECT 4 - THE BRIEF'S TWO HEADLINE QUESTIONS WERE UNANSWERABLE  (severity: high)
+--------------------------------------------------------------------------------
+Module B asks which of the four camera models is most accurate. measure_box.py
+had no way to know, because nothing compared the estimates against truth.
+Module E asks which method is robust to lighting vs rotation. Only rotation was
+ever exercised.
+Both are now measurable. Neither number existed before.
+
+
+================================================================================
+SECTION 3 : EXPERIMENTS RUN, AND WHAT THEY DECIDED
+================================================================================
+
+EXPERIMENT 1 - DOES WATERSHED SEPARATE TOUCHING BOXES?
+--------------------------------------------------------------------------------
+METHOD   Built synthetic frames with known box geometry and scored every method
+         by greedy IoU matching at IoU >= 0.5, over 5 frames per layout.
+LAYOUTS  2 touching with a vertical offset (truth 2)
+         3 touching with a vertical offset (truth 3)
+         2 separate with a 20 px gap (truth 2)
+
+RESULTS  layout: 2 touching, y offset (truth 2)
+            method            det/frame  matched  missed  spurious   ms/f
+            split_merge            8.40        0      10        42   15.7
+            watershed              2.00        0      10        10   13.0
+            felzenszwalb           4.00       10       0        10  426.6
+            mean_shift            30.00        0      10       150 3059.6
+            production(otsu)       2.00        0      10        10    2.0
+
+         layout: 3 touching, y offset (truth 3)
+            split_merge           11.40        4      11        53   13.8
+            watershed              2.00        0      15        10   14.3
+            felzenszwalb           4.00       15       0         5  221.5
+            mean_shift            30.00        6       9       144 2210.2
+            production(otsu)       2.00        0      15        10    2.1
+
+         layout: 2 separate, 20 px gap (truth 2)
+            split_merge            9.00       10       0        35   12.3
+            watershed              3.00       10       0         5   12.5
+            felzenszwalb           5.00       10       0        15  214.0
+            mean_shift            30.00        5       5       145 2260.2
+            production(otsu)       3.00       10       0         5    2.0
+
+CONCLUSION (this is the brief's required discussion, now backed by numbers):
+  Felzenszwalb is the ONLY method of the four that separates touching boxes -
+  10/10 and 15/15 recall - because the concave step where two boxes meet is a
+  low-gradient edge that the region-adjacency graph's minimum-cut criterion
+  refuses to merge, while the box interiors are each internally coherent.
+  Watershed and Otsu+RETR_EXTERNAL BOTH merge the touching pair (0 recall). Mean
+  shift is unusable: it hits the 30-box cap on every single frame.
+  On genuinely separate boxes watershed and Otsu both reach 10/10.
+  So the honest answer is the opposite of what the project's notes claimed.
+
+EXPERIMENT 2 - CAN THE WATERSHED MARKER BUG BE FIXED CHEAPLY?
+--------------------------------------------------------------------------------
+TRIED   (a) per-component distance threshold (fixes DEFECT 2)
+        (b) distance-transform local maxima as markers
+        (c) erosion-split cores: erode each blob by the smallest radius that
+            breaks it apart, use the pieces as markers
+        (d) combinations of the above
+
+BUGS I INTRODUCED AND FIXED WHILE PROTOTYPING (recorded because they are the
+classic failure modes of this code):
+  - foreground markers numbered from 1 collide with cv2.watershed's reserved
+    background label 1, so every marker was silently erased. Markers must start
+    at 2 (0 = unknown, 1 = background).
+  - background must be the area OUTSIDE the objects, i.e.
+    dilate(binary == 0). Marking "everything without a marker" as background
+    turns the unclaimed object interior into background and the watershed
+    returns only the marker cores.
+  - erosion over the full frame for 15 radii costs 239 ms/frame; it has to run
+    inside each component's bounding box.
+
+RESULT  variant              layout                     det/frame  matched    ms/f
+        current watershed    2 touching, y offset          2.00      0/10    17.7
+        per-component ws     2 touching, y offset          2.00      0/10    92.6
+        production(otsu)     2 touching, y offset          2.00      0/10     2.8
+        current watershed    2 separate, 20 px gap         3.00     10/10    16.4
+        per-component ws     2 separate, 20 px gap         3.00      0/10   149.4
+        production(otsu)     2 separate, 20 px gap         3.00     10/10     2.6
+
+DECISION REJECT the rewrite. It is 5x to 9x SLOWER and it made the separate-box
+        case WORSE (0/10 against the existing 10/10), because markers that are
+        eroded cores leave the reported box short of the true edge. Keeping the
+        existing detector is the correct engineering call, and the measured
+        finding above is the honest deliverable for this module.
+
+EXPERIMENT 3 - WHY IS MODULE E INSENSITIVE TO LIGHTING?  (this one overturned me)
+--------------------------------------------------------------------------------
+I first wrote the Module E robustness note asserting the eigenbox is the most
+lighting-sensitive classifier, because PCA on raw pixels "ought" to be. The
+measurement said otherwise:
+            method                       upright   rotated 15   relit
+            alignment                       91.7%         -        -
+            eigenbox_pca                    91.7%         -        -
+            hu_moments                      50.0%      50.0%     50.0%
+            eigenbox_pca_rotated_15deg        -        58.3%       -
+            eigenbox_pca_relit               -           -       91.7%
+            hu_moments_relit                 -           -       58.3%
+            ensemble_vote                   91.7%         -        -
+            ensemble_vote_rotated_15deg       -        75.0%       -
+            ensemble_vote_relit             -           -       91.7%
+The eigenbox is UNCHANGED under relighting. I was about to ship a wrong note, so
+I measured why:
+            raw crop mean/std                   160.18    92.63
+            relit crop mean/std                 110.78    74.02
+            raw vs relit L1 distance              49.40
+            after equalizeHist, prepared L1        0.00729
+            raw vs rotated L1                      7.55
+            prepared vs rotated L1                 0.14947
+prepare_crop() calls cv2.equalizeHist, and equalisation is invariant to a
+monotone remap of intensity - which is exactly what a gain and a gamma are. So
+the 49.4 grey-level lighting shift collapses to 0.007, while the 15 deg rotation
+still moves the prepared vector by 0.149, twenty times more, because no
+equalisation can undo a rotation. Lighting robustness comes from the shared
+preprocessing, not from any classifier. The note now says that, with the numbers.
+
+
+================================================================================
+SECTION 4 : WORK COMPLETED
+================================================================================
+
+DONE - MODULE A
+  [x] Reproduced the false "watershed is downstream" claim and found the cause:
+      production_detections() is Otsu + findContours, never watershed.
+  [x] tools/make_test_video.py: added --layout {separated,touching} and --speed.
+      The touching layout overlaps two boxes by 5 px with a 25 px vertical
+      offset, so the union is one blob with a concave step - the only evidence
+      any shape-based method has. Generated data/smoke_touching.mp4.
+  [x] Measured all four methods on touching vs separate layouts (EXPERIMENT 1)
+      and rewrote segmentation_notes.txt to state the true ranking, with the
+      note that watershed and Otsu both merge touching boxes while
+      felzenszwalb separates them, and the reason why.
+  [x] Documented the watershed marker-threshold bug (DEFECT 2) with its
+      measurement, and recorded why the obvious fix was rejected.
+
+DONE - MODULE B
+  [x] measure_box.py: added --true-size WIDTH_CM HEIGHT_CM.
+  [x] Prints all four estimates side by side with per-axis percentage error,
+      ranks them by mean absolute error, and names the winner.
+  [x] Replaced the missing "which model and why" comment with a discussion
+      grounded in the ranking: which model wins is a property of the capture
+      geometry (wide FOV / close camera => full perspective; long focal length /
+      far camera => orthographic), not a fixed ordering, and a plane
+      homography should be preferred because it does not inherit the reference
+      box's placement error.
+  [x] Verified end to end:
+            orthographic         18.000 x 10.000 cm   width +0.00%  height -16.67%
+            weak_perspective     18.000 x 10.000 cm   width +0.00%  height -16.67%
+            affine               11.091 x  6.088 cm   width -38.38% height -49.26%
+            full_perspective     11.092 x  6.089 cm   width -38.38% height -49.26%
+            winner: orthographic, 8.33% mean abs error
+
+DONE - MODULE C
+  [x] optical_flow.py now prints the required dense-vs-sparse discussion:
+      dense differential LK gives coverage but is ill-posed on textureless box
+      faces (aperture problem, low gradient in all directions, vectors fall
+      below the eigenvalue threshold); sparse LK on goodFeaturesToTrack corners
+      is well-conditioned but only exists where there is texture; the 6-parameter
+      affine fit with RANSAC isolates coherent planar motion and rejects the
+      inconsistent vectors the aperture problem creates.
+  [x] Re-verified the speed path: 6.032 cm/s against a true 6.000 cm/s with
+      --cm-per-pixel 0.05 (0.5% error).
+
+DONE - MODULE D
+  [x] kalman.py: new KalmanStep dataclass recording, per track and per frame,
+      predicted / measurement / corrected / coasted. MultiBoxTracker now fills
+      self.last_step on every step. A brand-new track's cycle starts at the
+      measurement it was born on, because there is no prior state to extrapolate
+      from and showing a fake prediction would be dishonest.
+  [x] kalman_tracker.py: prints the explicit predict -> measure -> update cycle
+      for the first 12 consecutive frames (--cycle-frames, brief asks for >= 10),
+      and states clearly when a track is coasting on prediction alone with no
+      measurement, which is the observability demonstration.
+  [x] CSV now carries predicted_x, predicted_y, raw_x, raw_y, filtered_x,
+      filtered_y, coasted, dropout, so all three stages are inspectable.
+  [x] Added --measurement-noise SIGMA and --seed. Without it the three printed
+      stages are identical on the noise-free clip and the module demonstrates
+      nothing. Seeded, so runs are reproducible.
+  [x] Verified, at --measurement-noise 1.5 --dropout-start 3 --dropout-length 4:
+            frame 2  predict (111.50, 175.95)  measure (110.82, 174.01)
+                     correct (111.25, 175.24)
+            frame 3  predict (119.25, 175.24)  no measurement (coasting)
+                     correct (119.25, 175.24)
+      which is the brief's requirement: the three stages visible, and pure
+      prediction carrying the state through the 4-frame occlusion.
+
+DONE - MODULE E
+  [x] Added relight_image(gain, gamma): dims the crop and deepens the gamma, a
+      stand-in for a different exposure and lamp colour temperature.
+  [x] Accuracy table extended from 6 rows to 10: added
+      eigenbox_pca_rotated_15deg, eigenbox_pca_relit, hu_moments_relit and
+      ensemble_vote_relit, so both of the brief's perturbations are measured for
+      all three classifiers instead of one.
+  [x] ROBUSTNESS_NOTE written from the measurement, not from intuition, after
+      EXPERIMENT 3 overturned my first draft. It now explains the real
+      mechanism: equalizeHist in the shared preprocessing makes every method
+      robust to global lighting, so the measured spread is almost entirely
+      rotation, and no classifier's apparent lighting robustness is its own.
+
+VERIFIED AFTER EVERY MODULE EDIT
+  python -m pytest -q   ->  19 passed
+  python -m ruff check . ->  All checks passed!
+
+
+================================================================================
+SECTION 5 : WORK REMAINING
+================================================================================
+
+[x] TASK 6 - REFACTOR pipeline.py INTO A REUSABLE FUNCTION
+    Added PipelineConfig, PipelineResult, PipelineProgress, run_pipeline(config,
+    on_progress=None) and config_from_args(). The CLI keeps every flag and every
+    printed line, so the brief's deliverable and the documented commands are
+    unchanged. Verified byte-identical against the pre-refactor baseline:
+        stride=1  45 frames / 88 records   CSV identical: YES
+        stride=2  23 frames / 44 records   CSV identical: YES
+        stride=3  15 frames / 28 records   CSV identical: YES
+    One deliberate change: the loop now terminates on a dedicated counter
+    instead of len(frames), because the UI runs with write_video=False and
+    would otherwise never stop. The counters are incremented in lockstep, so
+    the frame counts above prove behaviour is identical.
+
+[x] TASK 7 - BUILD THE UI SERVER (app.py)
+    Stdlib http.server, no new dependencies. Endpoints: static assets,
+    POST /api/run, GET /api/status/<id>, GET /api/preview/<id>,
+    GET /api/artifacts, GET /api/artifact/<path> with HTTP byte-range support
+    so the recorded video can seek. Jobs run on a worker thread with the
+    newest JPEG preview held in memory.
+    Path traversal is refused on both the static and artifact routes, and
+    absolute paths outside the project are rejected.
+
+    THREE REAL BUGS FOUND BY TESTING THE ENDPOINTS, NOT BY READING THE CODE:
+    1. NaN is not valid JSON. Rows carry NaN for unknown sizes and Python's
+       json module emitted a bare NaN token, which JSON.parse rejects, so the
+       whole response would have failed in the browser. Fixed with _json_safe(),
+       which walks the payload and maps non-finite floats to null.
+    2. Job id did not match the output folder. _start_job minted an id, then
+       JobRegistry.create minted a different one, so the client could not
+       derive the artifact directory. create() now accepts an explicit id.
+    3. Artifacts were serialised as absolute paths. They are now root-relative
+       posix paths, which keeps the JSON host-independent.
+
+    Endpoint results: POST 202; job ran to done at 45/45; 135 records with
+    calibration and recognition both true; strict JSON confirmed free of NaN
+    and Infinity; preview 200 image/jpeg 10960 bytes; video 200 video/mp4
+    100828 bytes; range bytes=0-1023 -> 206 with Content-Range
+    bytes 0-1023/100828; open-ended range clamped to bytes 10000-100827.
+    Security: artifact traversal 404, static traversal 403, encoded traversal
+    404, absolute C:/Windows/win.ini 404, unknown job 404, missing video 400,
+    malformed JSON 400. node --check webui/app.js: syntax OK.
+
+[x] TASK 8 - BUILD THE DASHBOARD FRONT END
+    Single page, no build step, no framework. Run controls for video,
+    calibration, recognition root, cm-per-pixel, stride, flow-every, max-frames,
+    max-boxes, belt velocity and keep-static. Live annotated preview plus a
+    progress bar during the run, then a preview/recorded-video toggle, six KPI
+    tiles, belt-speed and trajectory charts drawn from the result JSON on
+    canvas, a filterable per-track table, and thumbnails of the artifacts each
+    module wrote.
+
+[x] TASK 9 - FULL VERIFICATION SWEEP
+    python -m ruff check .                        -> All checks passed!
+    python -m compileall common module_a_*
+      module_b_* module_c_* module_d_* module_e_*
+      pipeline.py app.py                         -> OK
+    python -m pytest -q                           -> 40 passed (was 19)
+    Every module re-run end to end after the edits: A separated and touching,
+    B with --true-size, C with --cm-per-pixel, D with --measurement-noise and
+    dropout, E full table. Pipeline re-run at stride 1/2/3 -> all MATCH the
+    pre-refactor counts.
+    Server start and every endpoint exercised with curl, including ranges,
+    traversal attempts and error paths.
+
+    New test file tests/test_pipeline_api.py, 21 tests, added because the
+    refactor and the JSON fix are exactly the kind of change that breaks
+    silently. It pins the stride 1/2/3 frame and record counts to the
+    pre-refactor CLI so a future loop change cannot quietly alter documented
+    behaviour, and it covers _json_safe, _relative_to_root and JobRegistry.
+
+[x] TASK 10 - UPDATE README
+    Added the per-module "what it demonstrates" table the brief requires, one
+    row per module, each carrying the measured evidence rather than a
+    description of the method.
+    Corrected the Module A section, which repeated the false watershed claim,
+    and documented the touching-box result that replaced it.
+    Documented the new flags: --measurement-noise, --seed, --cycle-frames,
+    --true-size, --layout, --speed. Documented the UI and how to start it.
+    Documented run_pipeline() as the importable entry point.
+    Updated Verification to 40 tests and included app.py in compileall.
+
+--------------------------------------------------------------------------------
+STILL OUTSTANDING - REQUIRES THE USER, NOT THE CODE
+--------------------------------------------------------------------------------
+- Real footage for the final submission, plus a 10-minute screen recording.
+  The brief requires both and neither can be produced from a synthetic clip.
+- Real checkerboard captures for Module B, and labelled recognition crops from
+  real footage for Module E. The bundled fixtures validate the code paths; they
+  do not make the accuracy figures meaningful.
+
+
+================================================================================
+SECTION 6 : DECISIONS TAKEN, WITH REASONS  (so they are not relitigated)
+================================================================================
+1. The production detector stays Otsu + findContours. The watershed rewrite was
+   measured 5-9x slower AND less accurate on the separate-box case. Correctness
+   of the running pipeline beat a more elegant segmentation.
+2. The Module E robustness note was rewritten after the measurement contradicted
+   my first draft. The lesson generalises: on this project, assert nothing that
+   has not been measured. The existing WORK_LOG is explicit about an earlier
+   "140x" headline that turned out to be an artefact of broken scoring.
+3. The UI is dependency-free. requirements.txt pins upper bounds for
+   reproducibility; a dashboard is not worth a framework that can break the
+   install on a lab machine.
+4. Module B's recommendation is printed from a ranking, not from prose. "Which
+   camera model is most accurate" depends on the capture, so the tool scores all
+   four against a supplied truth and lets the numbers choose.
+5. Synthetic fixtures remain clearly labelled as smoke-test fixtures. The brief
+   requires real footage for the final submission and that is still outstanding;
+   nothing in this pass changes that.
+6. Three UI bugs were found by curling the running server, not by reading it.
+   NaN-in-JSON in particular cannot be seen by inspection and would have shipped
+   a dashboard that silently failed on every response.

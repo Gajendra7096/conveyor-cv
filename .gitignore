@@ -1,0 +1,28 @@
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+.ruff_cache/
+outputs/
+
+# Recorded and uploaded footage never belongs in the repository.
+data/*.mp4
+data/*.avi
+data/*.mov
+data/*.mkv
+data/*.webm
+data/uploads/
+data/calibration_images/
+data/recognition/
+
+# Calibration solves and generated imagery.
+*.npz
+*.png
+*.jpg
+*.jpeg
+
+# Editor and OS noise.
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
